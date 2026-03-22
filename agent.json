@@ -1,0 +1,60 @@
+{
+  "name": "Sentinel DeFi Guardian",
+  "version": "0.1.0",
+  "description": "Verifiable autonomous agent that monitors Lido vault positions, tracks yield health, self-funds operations from DeFi yield via Zyfai, and delivers intelligent alerts. Runs in TEE on EigenCompute for cryptographic proof of honest, unbiased execution.",
+  "author": "Moltiverse",
+  "runtime": "eigencompute-tee",
+  "identity": {
+    "standard": "ERC-8004",
+    "registry": "0x8004A818BFB912233c491871b3d84c89A494BD9e",
+    "chain": "base-sepolia"
+  },
+  "capabilities": [
+    "defi-monitoring",
+    "vault-health-tracking",
+    "yield-management",
+    "autonomous-alerts",
+    "lido-steth-analysis",
+    "gas-optimization",
+    "risk-assessment",
+    "mcp-server"
+  ],
+  "protocols": {
+    "lido": {
+      "operations": ["monitor", "stake", "unstake", "wrap", "unwrap", "query"],
+      "networks": ["ethereum-mainnet", "base"]
+    },
+    "zyfai": {
+      "operations": ["deposit", "withdraw-yield", "monitor-earnings"],
+      "networks": ["arbitrum", "base"]
+    },
+    "erc8004": {
+      "operations": ["register", "query", "reputation"],
+      "networks": ["base-sepolia", "base"]
+    }
+  },
+  "endpoints": {
+    "health": "/health",
+    "status": "/status",
+    "agentCard": "/.well-known/agent-card.json",
+    "mcp": "stdio"
+  },
+  "trust": {
+    "models": ["tee-attestation", "reputation", "crypto-economic"],
+    "attestation": "eigencompute-tee-v1",
+    "verifiable": true
+  },
+  "economy": {
+    "self_funding": true,
+    "yield_source": "zyfai",
+    "principal_protected": true,
+    "revenue_model": "yield-from-steth-via-zyfai"
+  },
+  "guardrails": {
+    "max_spend_per_tx": "0.01 ETH",
+    "principal_withdrawal": false,
+    "require_dry_run": true,
+    "alert_on_anomaly": true,
+    "human_escalation_threshold": "critical"
+  }
+}
