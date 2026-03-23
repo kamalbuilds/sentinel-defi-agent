@@ -1,28 +1,14 @@
-import { McpServer, ResourceTemplate } from "@modelcontextprotocol/sdk/server/mcp.js";
+import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
 import { LidoMonitor } from "../lido/monitor.js";
 import { config } from "../utils/config.js";
 import { logger } from "../utils/logger.js";
 
-/**
- * Sentinel MCP Server
- *
- * Exposes Lido vault monitoring and DeFi analysis tools
- * to other AI agents via the Model Context Protocol.
- *
- * Tools:
- * - get_vault_status: Current Lido vault health metrics
- * - get_position: Check a wallet's stETH/wstETH position
- * - get_apy: Current and historical APY data
- * - get_alerts: Recent alert history
- * - analyze_risk: Risk assessment for a given position
- * - dry_run_stake: Simulate a staking operation
- */
-
 async function main() {
+  // Use Ethereum mainnet RPCs for Lido monitoring (not Base)
   const monitor = new LidoMonitor(
-    config.baseMainnetRpc || "https://eth.llamarpc.com",
+    config.ethRpcUrls,
     config.stethAddress,
     config.wstethAddress
   );
@@ -46,12 +32,20 @@ async function main() {
               type: "text" as const,
               text: JSON.stringify(
                 {
-                  totalPooledEther: snapshot.totalPooledEther.toString(),
-                  totalShares: snapshot.totalShares.toString(),
-                  shareRate: snapshot.shareRate,
-                  estimatedApy: snapshot.estimatedApy,
-                  gasPriceGwei: Number(snapshot.gasPrice) / 1e9,
+                  totalPooledEther: (
+                    Number(snapshot.totalPooledEther) / 1e18
+                  ).toFixed(2),
+                  totalShares: (
+                    Number(snapshot.totalShares) / 1e18
+                  ).toFixed(2),
+                  shareRate: snapshot.shareRate.toFixed(6),
+                  estimatedApy: snapshot.estimatedApy.toFixed(2) + "%",
+                  gasPriceGwei:
+                    (Number(snapshot.gasPrice) / 1e9).toFixed(1) +
+                    " gwei",
+                  blockNumber: snapshot.blockNumber.toString(),
                   timestamp: new Date(snapshot.timestamp).toISOString(),
+                  snapshotCount: monitor.getSnapshotCount(),
                 },
                 null,
                 2
@@ -64,7 +58,7 @@ async function main() {
           content: [
             {
               type: "text" as const,
-              text: `Error fetching vault status: ${error}`,
+              text: `Error fetching vault status: ${error instanceof Error ? error.message : String(error)}`,
             },
           ],
           isError: true,
@@ -100,7 +94,7 @@ async function main() {
           content: [
             {
               type: "text" as const,
-              text: `Error fetching position: ${error}`,
+              text: `Error fetching position: ${error instanceof Error ? error.message : String(error)}`,
             },
           ],
           isError: true,
@@ -115,24 +109,42 @@ async function main() {
     "Get current stETH APY and 7-day moving average",
     {},
     async () => {
-      const snapshot = await monitor.getVaultSnapshot();
-      const avg7d = monitor.getApy7DayAverage();
-      return {
-        content: [
-          {
-            type: "text" as const,
-            text: JSON.stringify(
-              {
-                currentApy: snapshot.estimatedApy,
-                sevenDayAverage: avg7d,
-                dataPoints: monitor.getRecentSnapshots().length,
-              },
-              null,
-              2
-            ),
-          },
-        ],
-      };
+      try {
+        const snapshot = await monitor.getVaultSnapshot();
+        const avg7d = monitor.getApy7DayAverage();
+        return {
+          content: [
+            {
+              type: "text" as const,
+              text: JSON.stringify(
+                {
+                  currentApy: snapshot.estimatedApy.toFixed(2) + "%",
+                  sevenDayAverage: avg7d.toFixed(2) + "%",
+                  dataPoints: monitor.getSnapshotCount(),
+                  trend:
+                    snapshot.estimatedApy > avg7d
+                      ? "rising"
+                      : snapshot.estimatedApy < avg7d
+                        ? "falling"
+                        : "stable",
+                },
+                null,
+                2
+              ),
+            },
+          ],
+        };
+      } catch (error) {
+        return {
+          content: [
+            {
+              type: "text" as const,
+              text: `Error: ${error instanceof Error ? error.message : String(error)}`,
+            },
+          ],
+          isError: true,
+        };
+      }
     }
   );
 
@@ -147,22 +159,36 @@ async function main() {
         .describe("Number of recent alerts to return (default: 10)"),
     },
     async ({ count }) => {
-      const alerts = await monitor.analyzeAndAlert(config.alertThresholds);
-      return {
-        content: [
-          {
-            type: "text" as const,
-            text: JSON.stringify(
-              {
-                recentAlerts: alerts.slice(-(count || 10)),
-                totalAlerts: alerts.length,
-              },
-              null,
-              2
-            ),
-          },
-        ],
-      };
+      try {
+        const alerts = await monitor.analyzeAndAlert(
+          config.alertThresholds
+        );
+        return {
+          content: [
+            {
+              type: "text" as const,
+              text: JSON.stringify(
+                {
+                  recentAlerts: alerts.slice(-(count || 10)),
+                  totalAlerts: alerts.length,
+                },
+                null,
+                2
+              ),
+            },
+          ],
+        };
+      } catch (error) {
+        return {
+          content: [
+            {
+              type: "text" as const,
+              text: `Error: ${error instanceof Error ? error.message : String(error)}`,
+            },
+          ],
+          isError: true,
+        };
+      }
     }
   );
 
@@ -174,93 +200,108 @@ async function main() {
       wallet_address: z
         .string()
         .optional()
-        .describe("Optional wallet address to include position-specific risk"),
+        .describe(
+          "Optional wallet address to include position-specific risk"
+        ),
     },
     async ({ wallet_address }) => {
-      const snapshot = await monitor.getVaultSnapshot();
-      const gasPriceGwei = Number(snapshot.gasPrice) / 1e9;
+      try {
+        const snapshot = await monitor.getVaultSnapshot();
+        const gasPriceGwei = Number(snapshot.gasPrice) / 1e9;
 
-      const risks: string[] = [];
-      let riskScore = 0; // 0-100, higher = more risk
+        const risks: string[] = [];
+        let riskScore = 0;
 
-      // Gas risk
-      if (gasPriceGwei > 100) {
-        risks.push("HIGH GAS: Transactions will be expensive");
-        riskScore += 20;
-      } else if (gasPriceGwei > 50) {
-        risks.push("MODERATE GAS: Consider waiting for lower gas");
-        riskScore += 10;
-      }
-
-      // Share rate stability
-      const snapshots = monitor.getRecentSnapshots(10);
-      if (snapshots.length > 1) {
-        const rates = snapshots.map((s) => s.shareRate);
-        const maxRate = Math.max(...rates);
-        const minRate = Math.min(...rates);
-        const volatility = ((maxRate - minRate) / minRate) * 100;
-        if (volatility > 0.5) {
-          risks.push(
-            `SHARE RATE VOLATILITY: ${volatility.toFixed(3)}% variation detected`
-          );
-          riskScore += 25;
+        if (gasPriceGwei > 100) {
+          risks.push("HIGH GAS: Transactions will be expensive");
+          riskScore += 20;
+        } else if (gasPriceGwei > 50) {
+          risks.push("MODERATE GAS: Consider waiting for lower gas");
+          riskScore += 10;
         }
-      }
 
-      // APY sustainability
-      if (snapshot.estimatedApy > 10) {
-        risks.push("UNUSUALLY HIGH APY: May be unsustainable");
-        riskScore += 15;
-      }
-
-      let positionRisk = null;
-      if (wallet_address) {
-        try {
-          const position = await monitor.getPositionSnapshot(
-            wallet_address as `0x${string}`
-          );
-          const totalValue = parseFloat(position.totalValueEth);
-          if (totalValue > 100) {
-            risks.push("LARGE POSITION: High absolute risk exposure");
-            riskScore += 10;
+        const snapshots = monitor.getRecentSnapshots(10);
+        if (snapshots.length > 1) {
+          const rates = snapshots.map((s) => s.shareRate);
+          const maxRate = Math.max(...rates);
+          const minRate = Math.min(...rates);
+          const volatility = ((maxRate - minRate) / minRate) * 100;
+          if (volatility > 0.5) {
+            risks.push(
+              `SHARE RATE VOLATILITY: ${volatility.toFixed(3)}% variation`
+            );
+            riskScore += 25;
           }
-          positionRisk = {
-            totalValueEth: position.totalValueEth,
-            stethExposure: position.stethBalance,
-            wstethExposure: position.wstethBalance,
-          };
-        } catch {
-          risks.push("Could not fetch position data");
         }
+
+        if (snapshot.estimatedApy > 10) {
+          risks.push("UNUSUALLY HIGH APY: May be unsustainable");
+          riskScore += 15;
+        }
+
+        let positionRisk = null;
+        if (wallet_address) {
+          try {
+            const position = await monitor.getPositionSnapshot(
+              wallet_address as `0x${string}`
+            );
+            const totalValue = parseFloat(position.totalValueEth);
+            if (totalValue > 100) {
+              risks.push("LARGE POSITION: High absolute risk exposure");
+              riskScore += 10;
+            }
+            positionRisk = {
+              totalValueEth: position.totalValueEth,
+              stethExposure: position.stethBalance,
+              wstethExposure: position.wstethBalance,
+            };
+          } catch {
+            risks.push("Could not fetch position data");
+          }
+        }
+
+        const riskLevel =
+          riskScore > 50
+            ? "HIGH"
+            : riskScore > 25
+              ? "MODERATE"
+              : "LOW";
+
+        return {
+          content: [
+            {
+              type: "text" as const,
+              text: JSON.stringify(
+                {
+                  riskLevel,
+                  riskScore,
+                  risks,
+                  position: positionRisk,
+                  recommendation:
+                    riskScore > 50
+                      ? "Consider reducing exposure or waiting for conditions to stabilize"
+                      : riskScore > 25
+                        ? "Monitor closely, conditions are changing"
+                        : "Conditions appear stable for operations",
+                  timestamp: new Date().toISOString(),
+                },
+                null,
+                2
+              ),
+            },
+          ],
+        };
+      } catch (error) {
+        return {
+          content: [
+            {
+              type: "text" as const,
+              text: `Error: ${error instanceof Error ? error.message : String(error)}`,
+            },
+          ],
+          isError: true,
+        };
       }
-
-      const riskLevel =
-        riskScore > 50 ? "HIGH" : riskScore > 25 ? "MODERATE" : "LOW";
-
-      return {
-        content: [
-          {
-            type: "text" as const,
-            text: JSON.stringify(
-              {
-                riskLevel,
-                riskScore,
-                risks,
-                position: positionRisk,
-                recommendation:
-                  riskScore > 50
-                    ? "Consider reducing exposure or waiting for conditions to stabilize"
-                    : riskScore > 25
-                      ? "Monitor closely, conditions are changing"
-                      : "Conditions appear stable for operations",
-                timestamp: new Date().toISOString(),
-              },
-              null,
-              2
-            ),
-          },
-        ],
-      };
     }
   );
 
@@ -269,55 +310,68 @@ async function main() {
     "dry_run_stake",
     "Simulate a staking operation to preview expected outcomes without executing",
     {
-      amount_eth: z.string().describe("Amount of ETH to simulate staking"),
+      amount_eth: z
+        .string()
+        .describe("Amount of ETH to simulate staking"),
     },
     async ({ amount_eth }) => {
-      const snapshot = await monitor.getVaultSnapshot();
-      const amountWei = BigInt(
-        Math.floor(parseFloat(amount_eth) * 1e18)
-      );
+      try {
+        const snapshot = await monitor.getVaultSnapshot();
+        const amountWei = BigInt(
+          Math.floor(parseFloat(amount_eth) * 1e18)
+        );
 
-      const expectedSteth = amountWei; // 1:1 on deposit
-      const expectedShares =
-        (amountWei * snapshot.totalShares) / snapshot.totalPooledEther;
-      const dailyYield =
-        (parseFloat(amount_eth) * snapshot.estimatedApy) / 100 / 365;
-      const gasCost =
-        Number(snapshot.gasPrice) * 150000; // ~150k gas for stake
+        const expectedShares =
+          (amountWei * snapshot.totalShares) /
+          snapshot.totalPooledEther;
+        const dailyYield =
+          (parseFloat(amount_eth) * snapshot.estimatedApy) / 100 / 365;
+        const gasCost = Number(snapshot.gasPrice) * 150000;
 
-      return {
-        content: [
-          {
-            type: "text" as const,
-            text: JSON.stringify(
-              {
-                simulation: true,
-                input: { amountEth: amount_eth },
-                expected: {
-                  stethReceived: amount_eth,
-                  sharesReceived: expectedShares.toString(),
-                  estimatedDailyYield: `${dailyYield.toFixed(6)} ETH`,
-                  estimatedAnnualYield: `${(dailyYield * 365).toFixed(4)} ETH`,
-                  currentApy: `${snapshot.estimatedApy.toFixed(2)}%`,
+        return {
+          content: [
+            {
+              type: "text" as const,
+              text: JSON.stringify(
+                {
+                  simulation: true,
+                  input: { amountEth: amount_eth },
+                  expected: {
+                    stethReceived: amount_eth,
+                    sharesReceived: expectedShares.toString(),
+                    estimatedDailyYield: `${dailyYield.toFixed(6)} ETH`,
+                    estimatedAnnualYield: `${(dailyYield * 365).toFixed(4)} ETH`,
+                    currentApy: `${snapshot.estimatedApy.toFixed(2)}%`,
+                  },
+                  costs: {
+                    estimatedGasCostWei: gasCost.toString(),
+                    estimatedGasCostGwei: (gasCost / 1e9).toFixed(4),
+                    currentGasPrice: `${(Number(snapshot.gasPrice) / 1e9).toFixed(1)} gwei`,
+                  },
+                  warning:
+                    "This is a dry run simulation. Actual results may vary.",
                 },
-                costs: {
-                  estimatedGasCostWei: gasCost.toString(),
-                  estimatedGasCostGwei: (gasCost / 1e9).toFixed(4),
-                  currentGasPrice: `${(Number(snapshot.gasPrice) / 1e9).toFixed(1)} gwei`,
-                },
-                warning:
-                  "This is a dry run simulation. Actual results may vary.",
-              },
-              null,
-              2
-            ),
-          },
-        ],
-      };
+                null,
+                2
+              ),
+            },
+          ],
+        };
+      } catch (error) {
+        return {
+          content: [
+            {
+              type: "text" as const,
+              text: `Error: ${error instanceof Error ? error.message : String(error)}`,
+            },
+          ],
+          isError: true,
+        };
+      }
     }
   );
 
-  // Resources
+  // Resource: Agent card
   server.resource(
     "agent-card",
     "agent://sentinel/card",
@@ -331,13 +385,17 @@ async function main() {
               name: "Sentinel DeFi Guardian",
               version: "0.1.0",
               description:
-                "Verifiable autonomous agent monitoring Lido vaults with TEE attestation",
+                "Verifiable autonomous agent monitoring Lido vaults with TEE attestation on EigenCompute",
               capabilities: [
                 "vault-monitoring",
                 "risk-assessment",
                 "yield-tracking",
                 "alert-delivery",
+                "position-analysis",
+                "staking-simulation",
               ],
+              eigencomputeAppId: config.eigencomputeAppId,
+              verifiabilityDashboard: `https://verify-sepolia.eigencloud.xyz/app/${config.eigencomputeAppId}`,
             },
             null,
             2

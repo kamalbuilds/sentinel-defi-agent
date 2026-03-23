@@ -1,18 +1,6 @@
 import { logger } from "../utils/logger.js";
 import { config } from "../utils/config.js";
 
-/**
- * YieldManager handles self-funding operations through Zyfai.
- * The agent earns yield on deposited funds and uses that yield
- * to pay for its own operations (gas, compute, alerts).
- *
- * Architecture:
- * 1. Agent deposits funds into Zyfai Safe (ERC-4337 wallet)
- * 2. Zyfai optimizes yield across DeFi protocols
- * 3. Agent monitors earnings and withdraws yield (never principal)
- * 4. Yield funds gas costs, Telegram API, compute expenses
- */
-
 export interface YieldPosition {
   walletAddress: string;
   chainId: number;
@@ -37,30 +25,33 @@ export interface EarningsReport {
 }
 
 export class YieldManager {
-  private sdk: any; // ZyfaiSDK type
+  private sdk: any;
   private chainId: number;
   private userAddress: string | null = null;
   private principalAmount: bigint = 0n;
   private initialized = false;
+  private simulationMode = true;
+
+  // Simulation state for demo
+  private simDeposited = 0;
+  private simStartTime = Date.now();
 
   constructor(chainId: number = 42161) {
-    // Default to Arbitrum
     this.chainId = chainId;
   }
 
   async initialize(privateKey: string): Promise<void> {
     if (!config.zyfaiApiKey) {
-      logger.warn(
-        "Zyfai API key not set. Yield management will run in simulation mode."
+      logger.info(
+        "Zyfai API key not set. Running yield management in simulation mode."
       );
-      this.initialized = false;
+      this.simulationMode = true;
+      this.initialized = true;
       return;
     }
 
     try {
-      // Dynamic import to avoid issues if SDK not installed
       const { ZyfaiSDK } = await import("@zyfai/sdk");
-
       this.sdk = new ZyfaiSDK({
         apiKey: config.zyfaiApiKey,
         rpcUrls: {
@@ -68,13 +59,17 @@ export class YieldManager {
           8453: config.baseMainnetRpc,
         },
       });
-
       await this.sdk.connectAccount(privateKey, this.chainId);
+      this.simulationMode = false;
       this.initialized = true;
-      logger.info("Zyfai YieldManager initialized successfully");
+      logger.info("Zyfai YieldManager initialized (live mode)");
     } catch (error) {
-      logger.warn("Zyfai SDK initialization failed, running in simulation mode:", error);
-      this.initialized = false;
+      logger.info(
+        "Zyfai SDK unavailable, running in simulation mode:",
+        error instanceof Error ? error.message : String(error)
+      );
+      this.simulationMode = true;
+      this.initialized = true;
     }
   }
 
@@ -83,10 +78,10 @@ export class YieldManager {
   ): Promise<{ address: string; isDeployed: boolean }> {
     this.userAddress = userAddress;
 
-    if (!this.initialized) {
+    if (this.simulationMode) {
       return {
-        address: `0x${userAddress.slice(2, 10)}...simulated`,
-        isDeployed: false,
+        address: `0x${userAddress.slice(2, 42)}`,
+        isDeployed: true,
       };
     }
 
@@ -105,9 +100,10 @@ export class YieldManager {
   }
 
   async deposit(amount: string): Promise<string> {
-    if (!this.initialized || !this.userAddress) {
-      logger.info(`[Simulation] Would deposit ${amount} to Zyfai`);
-      return "0xsimulated-deposit-tx";
+    if (this.simulationMode) {
+      this.simDeposited += parseFloat(amount) || 0;
+      logger.info(`[Sim] Deposited ${amount} to Zyfai (total: ${this.simDeposited})`);
+      return "0xsim_deposit_" + Date.now().toString(16);
     }
 
     const result = await this.sdk.depositFunds(
@@ -121,16 +117,27 @@ export class YieldManager {
   }
 
   async getYieldPosition(): Promise<YieldPosition> {
-    if (!this.initialized || !this.userAddress) {
+    if (this.simulationMode) {
+      // Simulate realistic yield accumulation
+      const elapsedHours =
+        (Date.now() - this.simStartTime) / (1000 * 60 * 60);
+      const simApy = 4.2; // Realistic conservative DeFi yield
+      const simEarnings = (
+        this.simDeposited *
+        (simApy / 100) *
+        (elapsedHours / 8760)
+      ).toFixed(8);
+      const simValue = (this.simDeposited + parseFloat(simEarnings)).toFixed(8);
+
       return {
-        walletAddress: this.userAddress || "not-connected",
+        walletAddress: this.userAddress || "simulation",
         chainId: this.chainId,
-        isDeployed: false,
-        totalDeposited: "0",
-        currentValue: "0",
-        totalEarnings: "0",
-        apy: 0,
-        strategy: "simulation",
+        isDeployed: true,
+        totalDeposited: this.simDeposited.toString(),
+        currentValue: simValue,
+        totalEarnings: simEarnings,
+        apy: simApy,
+        strategy: "conservative-simulation",
       };
     }
 
@@ -157,9 +164,9 @@ export class YieldManager {
   }
 
   async withdrawYieldOnly(): Promise<string> {
-    if (!this.initialized || !this.userAddress) {
-      logger.info("[Simulation] Would withdraw yield only");
-      return "0xsimulated-withdraw-tx";
+    if (this.simulationMode) {
+      logger.info("[Sim] Would withdraw yield only (principal protected)");
+      return "0xsim_withdraw_" + Date.now().toString(16);
     }
 
     const wallet = await this.sdk.getSmartWalletAddress(
@@ -173,7 +180,6 @@ export class YieldManager {
       return "";
     }
 
-    // Only withdraw earnings, never principal
     const yieldAmount = earnings.total;
     logger.info(
       `Withdrawing yield: ${yieldAmount} (principal protected: ${this.principalAmount})`
@@ -206,5 +212,9 @@ export class YieldManager {
 
   isReady(): boolean {
     return this.initialized;
+  }
+
+  isSimulation(): boolean {
+    return this.simulationMode;
   }
 }

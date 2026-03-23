@@ -41,20 +41,22 @@ export class SentinelAgent {
   private running = false;
   private startTime = 0;
   private alertHistory: AlertEvent[] = [];
-  private intervalId: ReturnType<typeof setInterval> | null = null;
+  private monitorInterval: ReturnType<typeof setInterval> | null = null;
+  private statusInterval: ReturnType<typeof setInterval> | null = null;
+  private cycleCount = 0;
 
   constructor() {
-    // Initialize Lido monitor (works with public RPC, no keys needed)
+    // Initialize Lido monitor with fallback RPCs
     this.monitor = new LidoMonitor(
-      "https://eth.llamarpc.com",
+      config.ethRpcUrls,
       config.stethAddress,
       config.wstethAddress
     );
 
-    // Initialize yield manager (needs Zyfai API key)
-    this.yieldManager = new YieldManager(42161); // Arbitrum
+    // Initialize yield manager (Arbitrum)
+    this.yieldManager = new YieldManager(42161);
 
-    // Initialize Telegram bot (needs bot token)
+    // Initialize Telegram bot
     this.telegram = new SentinelTelegramBot();
 
     // Wire up alert routing
@@ -62,66 +64,96 @@ export class SentinelAgent {
   }
 
   async start(): Promise<void> {
-    logger.info("=== SENTINEL DeFi GUARDIAN ===");
-    logger.info("Starting autonomous monitoring agent...");
+    logger.info("========================================");
+    logger.info("  SENTINEL DeFi GUARDIAN v0.1.0");
+    logger.info("  Verifiable Autonomous Agent");
+    logger.info("========================================");
     this.startTime = Date.now();
     this.running = true;
 
-    // Step 1: Initialize identity (if private key available)
+    // Step 1: Wire Telegram status provider before starting
+    this.telegram.setStatusProvider(() => this.getStatus());
+
+    // Step 2: Start Telegram bot (non-blocking)
+    await this.telegram.start();
+
+    // Step 3: Initialize identity (if private key available)
     if (config.agentPrivateKey) {
       try {
         this.identity = new ERC8004Identity(config.agentPrivateKey);
         const registered = await this.identity.isRegistered();
         if (registered) {
           const tokenId = await this.identity.getTokenId();
-          logger.info(`Agent identity: ERC-8004 #${tokenId}`);
+          logger.info(`Agent identity: ERC-8004 Token #${tokenId}`);
         } else {
-          logger.info("Agent not yet registered with ERC-8004");
+          logger.info(
+            "Agent not yet registered with ERC-8004. Run: npm run register"
+          );
         }
       } catch (error) {
-        logger.warn("Identity initialization failed:", error);
+        logger.warn(
+          "Identity check failed (non-fatal):",
+          error instanceof Error ? error.message : String(error)
+        );
       }
     } else {
-      logger.info("No private key set. Running in read-only monitoring mode.");
+      logger.info("No private key. Running in read-only monitoring mode.");
     }
 
-    // Step 2: Initialize yield manager
-    if (config.agentPrivateKey && config.zyfaiApiKey) {
+    // Step 4: Initialize yield manager
+    if (config.agentPrivateKey) {
       await this.yieldManager.initialize(config.agentPrivateKey);
+      const mode = this.yieldManager.isSimulation()
+        ? "simulation"
+        : "live";
+      logger.info(`Yield manager: ${mode} mode`);
     }
 
-    // Step 3: Start Telegram bot
-    await this.telegram.start();
-
-    // Step 4: Take initial snapshot
+    // Step 5: Take initial vault snapshot
     logger.info("Taking initial vault snapshot...");
     try {
       const snapshot = await this.monitor.getVaultSnapshot();
       logger.info(
-        `Initial snapshot: Share rate=${snapshot.shareRate.toFixed(6)}, Gas=${(Number(snapshot.gasPrice) / 1e9).toFixed(1)} gwei`
+        `Vault: Share rate=${snapshot.shareRate.toFixed(6)}, ` +
+          `Gas=${(Number(snapshot.gasPrice) / 1e9).toFixed(1)} gwei, ` +
+          `Block #${snapshot.blockNumber}`
+      );
+      logger.info(
+        `Total pooled: ${(Number(snapshot.totalPooledEther) / 1e18).toFixed(2)} ETH`
       );
     } catch (error) {
-      logger.error("Failed to take initial snapshot:", error);
+      logger.error(
+        "Initial snapshot failed (will retry in monitoring loop):",
+        error instanceof Error ? error.message : String(error)
+      );
     }
 
-    // Step 5: Start monitoring loop
-    logger.info(
-      `Starting monitoring loop (interval: ${config.monitorIntervalMs / 1000}s)`
-    );
-    this.intervalId = setInterval(
+    // Step 6: Start monitoring loop
+    const intervalSec = config.monitorIntervalMs / 1000;
+    logger.info(`Starting monitoring loop (every ${intervalSec}s)`);
+    this.monitorInterval = setInterval(
       () => this.monitoringCycle(),
       config.monitorIntervalMs
+    );
+
+    // Step 7: Start periodic status reports
+    this.statusInterval = setInterval(
+      () => this.sendPeriodicStatus(),
+      config.statusReportIntervalMs
     );
 
     // Run first cycle immediately
     await this.monitoringCycle();
 
-    logger.info("Sentinel is operational and monitoring.");
+    logger.info("========================================");
+    logger.info("  Sentinel is OPERATIONAL");
+    logger.info("========================================");
   }
 
   private async monitoringCycle(): Promise<void> {
+    this.cycleCount++;
+
     try {
-      // Analyze vault and generate alerts
       const alerts = await this.monitor.analyzeAndAlert(
         config.alertThresholds
       );
@@ -130,43 +162,85 @@ export class SentinelAgent {
         this.alertHistory.push(alert);
       }
 
-      // Keep alert history manageable
+      // Trim alert history
       if (this.alertHistory.length > 1000) {
         this.alertHistory = this.alertHistory.slice(-500);
       }
 
-      // Log cycle completion
-      const snapshot = this.monitor.getRecentSnapshots(1)[0];
-      if (snapshot) {
-        logger.debug(
-          `Cycle complete: APY=${snapshot.estimatedApy.toFixed(2)}%, Gas=${(Number(snapshot.gasPrice) / 1e9).toFixed(1)} gwei, Alerts=${alerts.length}`
-        );
+      // Log cycle summary every 5 cycles
+      if (this.cycleCount % 5 === 0) {
+        const snapshot = this.monitor.getLatestSnapshot();
+        if (snapshot) {
+          const gas = (Number(snapshot.gasPrice) / 1e9).toFixed(1);
+          const pooled = (
+            Number(snapshot.totalPooledEther) / 1e18
+          ).toFixed(2);
+          logger.info(
+            `Cycle #${this.cycleCount}: APY=${snapshot.estimatedApy.toFixed(2)}%, ` +
+              `Gas=${gas} gwei, Pooled=${pooled} ETH, ` +
+              `Alerts=${this.alertHistory.length}`
+          );
+        }
       }
     } catch (error) {
-      logger.error("Monitoring cycle error:", error);
+      logger.error(
+        `Cycle #${this.cycleCount} error:`,
+        error instanceof Error ? error.message : String(error)
+      );
     }
   }
 
   private async handleAlert(alert: AlertEvent): Promise<void> {
-    // Send to Telegram
-    await this.telegram.sendAlert(alert);
+    try {
+      await this.telegram.sendAlert(alert);
+    } catch (e) {
+      logger.error("Alert delivery error:", e);
+    }
 
-    // Log structured alert
-    logger.warn({
-      message: "Alert triggered",
-      alert,
-    });
-
-    // If critical, consider self-funding check
+    // On critical alerts, check if yield is available for emergency operations
     if (alert.severity === "critical" && this.yieldManager.isReady()) {
-      const report = await this.yieldManager.getEarningsReport();
-      logger.info(`Yield available for operations: ${report.availableYield}`);
+      try {
+        const report = await this.yieldManager.getEarningsReport();
+        logger.info(
+          `Yield available for operations: ${report.availableYield}`
+        );
+      } catch {
+        // non-fatal
+      }
+    }
+  }
+
+  private async sendPeriodicStatus(): Promise<void> {
+    try {
+      const status = await this.getStatus();
+      const uptimeMin = Math.floor(status.uptime / 60_000);
+      const uptimeStr =
+        uptimeMin >= 60
+          ? `${Math.floor(uptimeMin / 60)}h ${uptimeMin % 60}m`
+          : `${uptimeMin}m`;
+
+      const report =
+        `\u{1F4CB} *SENTINEL PERIODIC REPORT*\n\n` +
+        `*Vault:*\n` +
+        `  APY: ${status.vault.apy.toFixed(2)}%\n` +
+        `  7d Avg: ${status.vault.apy7d.toFixed(2)}%\n` +
+        `  Pooled: ${status.vault.totalPooledEth} ETH\n` +
+        `  Gas: ${status.vault.gasPrice} gwei\n\n` +
+        `*Agent:*\n` +
+        `  Uptime: ${uptimeStr}\n` +
+        `  Cycles: ${this.cycleCount}\n` +
+        `  Alerts: ${status.alerts.total}\n` +
+        `  Snapshots: ${status.vault.snapshotCount}`;
+
+      await this.telegram.sendStatusReport(report);
+      logger.info("Periodic status report sent");
+    } catch (e) {
+      logger.error("Failed to send periodic status:", e);
     }
   }
 
   async getStatus(): Promise<SentinelStatus> {
-    const snapshots = this.monitor.getRecentSnapshots(1);
-    const latestSnapshot = snapshots[0];
+    const latestSnapshot = this.monitor.getLatestSnapshot();
 
     let identityStatus = {
       registered: false,
@@ -175,16 +249,30 @@ export class SentinelAgent {
     };
 
     if (this.identity) {
-      const registered = await this.identity.isRegistered();
-      const tokenId = await this.identity.getTokenId();
-      identityStatus = {
-        registered,
-        tokenId: tokenId?.toString() || null,
-        address: this.identity.getAddress(),
-      };
+      try {
+        const registered = await this.identity.isRegistered();
+        const tokenId = await this.identity.getTokenId();
+        identityStatus = {
+          registered,
+          tokenId: tokenId?.toString() || null,
+          address: this.identity.getAddress(),
+        };
+      } catch {
+        // Use cached/default values on failure
+      }
     }
 
-    const yieldPosition = await this.yieldManager.getYieldPosition();
+    let yieldInfo = { initialized: false, earnings: "0", apy: 0 };
+    try {
+      const yieldPosition = await this.yieldManager.getYieldPosition();
+      yieldInfo = {
+        initialized: this.yieldManager.isReady(),
+        earnings: yieldPosition.totalEarnings,
+        apy: yieldPosition.apy,
+      };
+    } catch {
+      // non-fatal
+    }
 
     return {
       running: this.running,
@@ -195,20 +283,14 @@ export class SentinelAgent {
         apy: latestSnapshot?.estimatedApy || 0,
         apy7d: this.monitor.getApy7DayAverage(),
         totalPooledEth: latestSnapshot
-          ? (
-              Number(latestSnapshot.totalPooledEther) / 1e18
-            ).toFixed(2)
+          ? (Number(latestSnapshot.totalPooledEther) / 1e18).toFixed(2)
           : "0",
         gasPrice: latestSnapshot
           ? (Number(latestSnapshot.gasPrice) / 1e9).toFixed(1)
           : "0",
-        snapshotCount: this.monitor.getRecentSnapshots().length,
+        snapshotCount: this.monitor.getSnapshotCount(),
       },
-      yield: {
-        initialized: this.yieldManager.isReady(),
-        earnings: yieldPosition.totalEarnings,
-        apy: yieldPosition.apy,
-      },
+      yield: yieldInfo,
       alerts: {
         total: this.alertHistory.length,
         recent: this.alertHistory.slice(-10),
@@ -218,9 +300,8 @@ export class SentinelAgent {
 
   async stop(): Promise<void> {
     this.running = false;
-    if (this.intervalId) {
-      clearInterval(this.intervalId);
-    }
+    if (this.monitorInterval) clearInterval(this.monitorInterval);
+    if (this.statusInterval) clearInterval(this.statusInterval);
     this.telegram.stop();
     logger.info("Sentinel agent stopped.");
   }

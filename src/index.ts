@@ -1,6 +1,7 @@
 import { SentinelAgent } from "./agent/sentinel.js";
 import { logger } from "./utils/logger.js";
 import express from "express";
+import { config } from "./utils/config.js";
 
 const PORT = process.env.PORT || 3001;
 
@@ -18,13 +19,25 @@ async function main() {
 
   // Health check (for EigenCompute / Docker)
   app.get("/health", (_req, res) => {
-    res.json({ status: "ok", service: "sentinel-defi-guardian" });
+    res.json({
+      status: "ok",
+      service: "sentinel-defi-guardian",
+      uptime: process.uptime(),
+      timestamp: new Date().toISOString(),
+    });
   });
 
-  // Agent status
+  // Agent status (full)
   app.get("/status", async (_req, res) => {
-    const status = await agent.getStatus();
-    res.json(status);
+    try {
+      const status = await agent.getStatus();
+      res.json(status);
+    } catch (error) {
+      res.status(500).json({
+        error: "Failed to get status",
+        message: error instanceof Error ? error.message : String(error),
+      });
+    }
   });
 
   // Agent card (ERC-8004 discovery)
@@ -36,18 +49,8 @@ async function main() {
         "Verifiable autonomous agent that monitors Lido vault positions, self-funds from DeFi yield, and delivers intelligent alerts. TEE-attested on EigenCompute.",
       version: "0.1.0",
       endpoints: [
-        {
-          name: "MCP",
-          endpoint: `http://localhost:${PORT}/mcp`,
-        },
-        {
-          name: "Health",
-          endpoint: `http://localhost:${PORT}/health`,
-        },
-        {
-          name: "Status",
-          endpoint: `http://localhost:${PORT}/status`,
-        },
+        { name: "Health", endpoint: `/health` },
+        { name: "Status", endpoint: `/status` },
       ],
       capabilities: [
         "defi-monitoring",
@@ -63,17 +66,40 @@ async function main() {
         runtime: "eigencompute-tee",
         chains: ["ethereum", "base", "arbitrum"],
         protocols: ["lido", "zyfai", "erc-8004"],
+        eigencomputeAppId: config.eigencomputeAppId,
+        verifiabilityDashboard: `https://verify-sepolia.eigencloud.xyz/app/${config.eigencomputeAppId}`,
       },
     });
   });
 
+  // Metrics endpoint (lightweight)
+  app.get("/metrics", async (_req, res) => {
+    try {
+      const status = await agent.getStatus();
+      const lines = [
+        `# HELP sentinel_uptime_seconds Agent uptime in seconds`,
+        `sentinel_uptime_seconds ${(status.uptime / 1000).toFixed(0)}`,
+        `# HELP sentinel_vault_apy Current Lido vault APY`,
+        `sentinel_vault_apy ${status.vault.apy.toFixed(4)}`,
+        `# HELP sentinel_gas_gwei Current gas price in gwei`,
+        `sentinel_gas_gwei ${status.vault.gasPrice}`,
+        `# HELP sentinel_alert_total Total alerts fired`,
+        `sentinel_alert_total ${status.alerts.total}`,
+        `# HELP sentinel_snapshot_count Total vault snapshots taken`,
+        `sentinel_snapshot_count ${status.vault.snapshotCount}`,
+      ];
+      res.type("text/plain").send(lines.join("\n"));
+    } catch {
+      res.status(500).send("# error fetching metrics");
+    }
+  });
+
   app.listen(PORT, () => {
     logger.info(`Sentinel API listening on port ${PORT}`);
-    logger.info(`Health: http://localhost:${PORT}/health`);
-    logger.info(`Status: http://localhost:${PORT}/status`);
-    logger.info(
-      `Agent Card: http://localhost:${PORT}/.well-known/agent-card.json`
-    );
+    logger.info(`  Health:     http://localhost:${PORT}/health`);
+    logger.info(`  Status:     http://localhost:${PORT}/status`);
+    logger.info(`  Metrics:    http://localhost:${PORT}/metrics`);
+    logger.info(`  Agent Card: http://localhost:${PORT}/.well-known/agent-card.json`);
   });
 
   // Graceful shutdown
